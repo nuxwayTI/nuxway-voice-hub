@@ -8,3 +8,8 @@ flask==3.0.3
 twilio==9.3.2
 requests==2.32.3
 pytz==2024.1
+
+openai>=1.0.0
+fastapi
+uvicorn
+starlette
