@@ -32,6 +32,29 @@ ZOHO_SOURCE = os.getenv("ZOHO_SOURCE", "twilio-ivr").strip()
 ZOHO_CITY_DEFAULT = os.getenv("ZOHO_CITY_DEFAULT", "Cochabamba").strip()
 
 # =========================
+# PHONE NORMALIZATION (CRM)
+# - Si viene de afuera: normalmente llega +591... o número largo -> tomamos últimos 8 dígitos (Bolivia)
+# - Si viene interno (ext corta 2-6 dígitos): intentamos mapear o usar un fallback
+# =========================
+STRIP_COUNTRY_CODE = os.getenv("STRIP_COUNTRY_CODE", "1") == "1"
+LOCAL_NUMBER_LEN = int(os.getenv("LOCAL_NUMBER_LEN", "8"))  # Bolivia local usually 8
+
+# Si la llamada es interna y solo trae extensión corta (ej 22 / 4000),
+# puedes mapear a un celular real por extensión.
+EXT_TO_MOBILE = {
+    "22":   os.getenv("EXT_22_MOBILE", "").strip(),
+    "4000": os.getenv("EXT_4000_MOBILE", "").strip(),
+    "4001": os.getenv("EXT_4001_MOBILE", "").strip(),
+    "4002": os.getenv("EXT_4002_MOBILE", "").strip(),
+    "4003": os.getenv("EXT_4003_MOBILE", "").strip(),
+    "4007": os.getenv("EXT_4007_MOBILE", "").strip(),
+}
+
+# Fallback general para internas sin mapeo (solo para que NO vaya null).
+# Ejemplo: 70770144
+INTERNAL_DEFAULT_MOBILE = os.getenv("INTERNAL_DEFAULT_MOBILE", "").strip()
+
+# =========================
 # TWILIO SIP DOMAIN
 # =========================
 SIP_DOMAIN = os.getenv("SIP_DOMAIN", "nuxway.sip.twilio.com").strip()
@@ -65,7 +88,7 @@ GATHER_TIMEOUT = 15
 SPEECH_TIMEOUT = "auto"
 MAX_NOINPUT_ATTEMPTS = 3
 
-# Máximo 2 preguntas al LLM antes de "agente o colgar"
+# IMPORTANTE: Máximo 2 preguntas al LLM antes de "agente o colgar"
 MAX_LLM_TURNS = int(os.getenv("MAX_LLM_TURNS", "2"))
 
 MIN_CONFIDENCE_REPROMPT = 0.35
@@ -116,10 +139,9 @@ Reglas:
 - Respuestas cortas: 1 a 2 frases.
 - Máximo 1 pregunta por turno.
 - No suenes robótico.
+- Si el usuario pide hablar con una persona específica (por nombre), transfiere con esa persona.
+- Si el usuario pide soporte o un ingeniero (genérico), transfiere a soporte.
 - No inventes datos. Si no estás seguro, deriva a soporte.
-
-Si el usuario pide hablar con una persona específica (por nombre), transfiere con esa persona.
-Si el usuario pide soporte o un ingeniero (genérico), transfiere a soporte.
 
 Información (empresa):
 - Nuxway es distribuidor oficial de Yeastar.
@@ -165,12 +187,23 @@ def say(vr, text: str):
 
 def normalize(text: str) -> str:
     text = (text or "").lower().strip()
-    text = re.sub(r"[^a-záéíóúñ0-9 @._-]+", "", text)  # dejo caracteres útiles por si algún día capturas email
+    text = re.sub(r"[^a-záéíóúñ0-9 @._-]+", "", text)
     text = re.sub(r"\s+", " ", text).strip()
     return text
 
 def similarity(a: str, b: str) -> float:
     return SequenceMatcher(None, a, b).ratio()
+
+def normalize_digits(value: str) -> str:
+    value = (value or "").strip()
+    return re.sub(r"\D", "", value)
+
+def to_local_digits(digits: str) -> str:
+    if not digits:
+        return ""
+    if STRIP_COUNTRY_CODE and LOCAL_NUMBER_LEN > 0 and len(digits) > LOCAL_NUMBER_LEN:
+        return digits[-LOCAL_NUMBER_LEN:]
+    return digits
 
 def is_valid_e164(s: str) -> bool:
     return bool(re.fullmatch(r"\+\d{8,15}", (s or "").strip()))
@@ -226,6 +259,55 @@ def choose_caller_for_transfer(caller_real: str, tw_from: str) -> str:
         return DEFAULT_INTERNAL_FALLBACK_CALLER
 
     return DEFAULT_EXTERNAL_FALLBACK_CALLER
+
+# =========================
+# Phone for CRM:
+# - externo: +591... o largo -> local 8 dígitos
+# - interno: extensión corta -> map o fallback -> NUNCA null si puedes
+# =========================
+def get_phone_for_crm(caller_real: str, tw_from: str) -> str:
+    # 1) Si caller_real viene en E.164: sacamos local (últimos 8) para Bigin (si quieres)
+    if caller_real and is_valid_e164(caller_real):
+        digits = normalize_digits(caller_real)
+        return to_local_digits(digits)
+
+    # 2) Si caller_real viene como dígitos
+    if caller_real:
+        digits = normalize_digits(caller_real)
+        if len(digits) >= EXTERNAL_NUM_MIN_LEN:
+            return to_local_digits(digits)
+        # si es corto, lo tratamos como interno
+        ext = digits
+        mapped = (EXT_TO_MOBILE.get(ext) or "").strip()
+        if mapped:
+            return to_local_digits(normalize_digits(mapped))
+        if INTERNAL_DEFAULT_MOBILE:
+            return to_local_digits(normalize_digits(INTERNAL_DEFAULT_MOBILE))
+        return ext
+
+    # 3) Si no hay caller_real, miramos el From SIP
+    ext = extract_digits_from_sip_from(tw_from)
+    if ext:
+        mapped = (EXT_TO_MOBILE.get(ext) or "").strip()
+        if mapped:
+            return to_local_digits(normalize_digits(mapped))
+        if INTERNAL_DEFAULT_MOBILE:
+            return to_local_digits(normalize_digits(INTERNAL_DEFAULT_MOBILE))
+        return ext
+
+    return ""
+
+# =========================
+# Punto 2 (Zoho): split nombre/apellido para Last_Name requerido
+# =========================
+def split_first_last(full_name: str):
+    full_name = (full_name or "").strip()
+    parts = [p for p in full_name.split() if p]
+    if not parts:
+        return "", ""
+    if len(parts) == 1:
+        return parts[0], "N/A"
+    return parts[0], " ".join(parts[1:])
 
 # =========================
 # SPEECH HINTS / PARSER
@@ -326,9 +408,8 @@ def detect_intent_fecha_hora(text_norm: str):
 # INTENTS: DATOS / LEAD
 # =========================
 def detect_intent_lead(text_norm: str) -> bool:
-    t = text_norm or ""
-    # voz natural o "1"
-    if t.strip() in ["1", "uno", "unito"]:
+    t = (text_norm or "").strip()
+    if t in ["1", "uno"]:
         return True
     keys = [
         "datos", "dejar mis datos", "registrar", "registro",
@@ -341,10 +422,8 @@ def detect_intent_lead(text_norm: str) -> bool:
 def _abs_url(path: str) -> str:
     if not path.startswith("/"):
         path = "/" + path
-
     if not path.startswith(TWILIO_PREFIX):
         path = TWILIO_PREFIX + path
-
     if BASE_URL:
         return f"{BASE_URL}{path}"
     return path
@@ -368,7 +447,6 @@ def gather_prompt(action_url: str, prompt_text: str, num_digits: int = 4):
     return g
 
 def gather_post_answer(action_url: str, prompt_text: str):
-    # 0 => agente. Si no responde, colgamos.
     g = Gather(
         input="dtmf speech",
         num_digits=1,
@@ -381,7 +459,7 @@ def gather_post_answer(action_url: str, prompt_text: str):
         action_on_empty_result=True,
         speech_model="phone_call",
         enhanced=True,
-        hints="agente,humano,operador,soporte,cero,0",
+        hints="agente,humano,operador,soporte,cero,0,datos,uno,1",
     )
     say(g, prompt_text)
     return g
@@ -403,7 +481,7 @@ def transfer_to_user(vr, target_user: str, caller_real: str, tw_from: str):
 def llamar_openai(call_sid: str, user_text: str) -> str:
     if not OPENAI_API_KEY:
         logging.error("[OPENAI] OPENAI_API_KEY VACIA")
-        return "En este momento no tengo acceso al asistente inteligente. Si desea, lo comunico con un agente."
+        return "En este momento no tengo acceso al asistente inteligente. Si desea, lo comunico con soporte."
 
     headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
 
@@ -422,7 +500,7 @@ def llamar_openai(call_sid: str, user_text: str) -> str:
         r = session.post(OPENAI_URL, json=data, headers=headers, timeout=15)
         logging.warning(f"[OPENAI] status={r.status_code} body={r.text[:200]}")
         if r.status_code != 200:
-            return "Tengo un inconveniente técnico. Si desea, lo comunico con un agente."
+            return "Tengo un inconveniente técnico. Si desea, lo comunico con soporte."
 
         respuesta = r.json()["choices"][0]["message"]["content"].strip()
         conversaciones[call_sid].append({"role": "user", "content": user_text})
@@ -431,10 +509,11 @@ def llamar_openai(call_sid: str, user_text: str) -> str:
 
     except Exception as e:
         logging.exception(f"[OPENAI] EXCEPTION: {e}")
-        return "Estoy teniendo un inconveniente técnico. Si desea, lo comunico con un agente."
+        return "Estoy teniendo un inconveniente técnico. Si desea, lo comunico con soporte."
 
 # =========================
 # ZOHO FLOW DIRECTO
+# - Campos EXACTOS del Flow (Nombre / Apellidos requerido)
 # =========================
 def send_to_zoho_flow(payload: dict) -> dict:
     if not ZOHO_FLOW_WEBHOOK_URL:
@@ -448,27 +527,28 @@ def send_to_zoho_flow(payload: dict) -> dict:
         logging.exception(f"[ZOHO] EXCEPTION: {e}")
         return {"ok": False, "error": str(e)}
 
-def create_zoho_lead_from_call(call_sid: str, caller_real: str, name: str, company: str, notes: str = "") -> dict:
+def create_zoho_lead_from_call(call_sid: str, tw_from: str, caller_real: str, full_name: str, company: str, notes: str = "") -> dict:
+    first, last = split_first_last(full_name)
+
+    phone_for_crm = get_phone_for_crm(caller_real, tw_from)
+
     zoho_payload = {
-        "source": ZOHO_SOURCE,
-        "ts": int(time.time()),
-        "created_at": int(time.time()),
+        "Nombre": first or None,
+        "Apellidos": (last or "N/A"),  # requerido
+        "Company": (company or "").strip() or "",
+        "Móvil": phone_for_crm or None,
+        "Teléfono": "",
 
-        # usamos CallSid como id de conversación + caller_real si existe
-        "call_sid": call_sid,
-        "phone": caller_real or None,
+        "Correo electrónico": None,
 
-        "name": (name or "").strip() or None,
-        "company_name": (company or "").strip() or None,
-        "city": ZOHO_CITY_DEFAULT,
+        "Fuente de referencia": "WPPLLM",
+        "Update existing contact?": True,
+        "Descripción": (notes or "").strip(),
+        "Record Creation Source ID": call_sid,
 
-        "callback_requested": True,
-        "human_requested": None,
-
-        "last_intent": "ivr_lead_capture",
-        "reason": "twilio-ivr",
-        "notes": (notes or "").strip() or None,
+        "Fuente de Posible cliente": ZOHO_SOURCE,
     }
+
     return send_to_zoho_flow(zoho_payload)
 
 # =========================
@@ -552,7 +632,7 @@ def ivr_llm():
         logging.warning(f"[DTMF] digits recibido: {digits}")
 
         # =========================
-        # POST-ANSWER MODE: decidir agente o colgar
+        # POST-ANSWER MODE: decidir agente / datos / colgar
         # =========================
         if mode == "post":
             text_post = normalize(speech)
@@ -560,15 +640,13 @@ def ivr_llm():
             if digits == "0" or any(k in text_post for k in ["agente", "humano", "operador", "soporte", "ayuda", "mesa", "tecnico", "técnico"]):
                 return transfer_to_user(vr, DID_MAP["cola"], caller_real, tw_from)
 
-            # Si dijo "datos" acá, arrancamos lead
-            if detect_intent_lead(text_post) or digits == "1":
+            if digits == "1" or detect_intent_lead(text_post):
                 lead_stage[call_sid] = "ask_name"
                 say(vr, "Perfecto. Voy a registrar sus datos.")
                 vr.pause(length=0.2)
                 vr.append(gather_prompt("/ivr-llm?noinput=1", "¿Cuál es su nombre y apellido?", num_digits=1))
                 return Response(str(vr), mimetype="text/xml")
 
-            # Si no respondió, colgamos (el usuario también puede colgar cuando quiera)
             say(vr, "De acuerdo. Gracias por llamar a Nuxway. Hasta luego.")
             vr.hangup()
             return Response(str(vr), mimetype="text/xml")
@@ -580,27 +658,26 @@ def ivr_llm():
             if noinput <= MAX_NOINPUT_ATTEMPTS:
                 vr.pause(length=RETRY_PAUSE_SEC if noinput > 1 else INITIAL_PAUSE_SEC)
 
+                # Mensaje original + SOLO añadimos "datos/1"
                 if noinput == 1:
                     prompt = (
                         f"{saludo_por_hora()} Gracias por llamar a Nuxway Technology. "
-                        "Si desea un agente diga agente o marque cero. "
-                        "Si desea dejar sus datos diga datos o marque uno. "
-                        "O puede pedir el nombre de la persona."
+                        "Diga el nombre de la persona con la que desea comunicarse. "
+                        "Para soporte, marque cero o diga soporte. "
+                        "Para dejar sus datos, diga datos o marque uno."
                     )
                 else:
                     prompt = (
                         "Disculpe, no le escuché bien. "
-                        "Diga agente o marque cero. "
-                        "Diga datos o marque uno. "
-                        "O diga el nombre: Pablo, Gonzalo, Vladimir, Paola o Ximena."
+                        "Para transferirle, dígame solo el nombre: Pablo, Gonzalo, Vladimir, Paola o Ximena. "
+                        "O marque cero para soporte. "
+                        "Para dejar sus datos, diga datos o marque uno."
                     )
 
                 vr.append(gather_prompt(f"/ivr-llm?noinput={noinput+1}", prompt))
                 return Response(str(vr), mimetype="text/xml")
 
-            # si hay mucho silencio, transferimos a soporte o colgamos.
-            # Para tu caso: mejor transferir a soporte.
-            say(vr, "Parece que la llamada está con poco audio. Le comunico con un agente.")
+            say(vr, "Parece que la llamada está con poco audio. Le comunico con soporte.")
             return transfer_to_user(vr, DID_MAP["cola"], caller_real, tw_from)
 
         # =========================
@@ -616,10 +693,11 @@ def ivr_llm():
             vr.append(gather_prompt("/ivr-llm?noinput=1", "Disculpe, no le entendí bien. Repita por favor."))
             return Response(str(vr), mimetype="text/xml")
 
+        logging.info(f"[CALL {call_sid}] speech='{text}' candidate='{name_candidate}' digits='{digits}' llm_turns={llm_turns[call_sid]} lead_stage={lead_stage[call_sid]}")
+
         # =========================
         # LEAD CAPTURE (ETAPAS)
         # =========================
-        # Si el usuario pidió datos (voz) o marcó 1
         if digits == "1" or detect_intent_lead(text):
             lead_stage[call_sid] = "ask_name"
             say(vr, "Perfecto. Voy a registrar sus datos en el CRM.")
@@ -627,7 +705,6 @@ def ivr_llm():
             vr.append(gather_prompt("/ivr-llm?noinput=1", "¿Cuál es su nombre y apellido?", num_digits=1))
             return Response(str(vr), mimetype="text/xml")
 
-        # Si estamos en etapa nombre
         if lead_stage[call_sid] == "ask_name":
             possible_name = (speech or "").strip()
             if possible_name and len(possible_name) >= 2:
@@ -641,22 +718,21 @@ def ivr_llm():
             vr.append(gather_prompt("/ivr-llm?noinput=1", "¿Me repite su nombre y apellido, por favor?", num_digits=1))
             return Response(str(vr), mimetype="text/xml")
 
-        # Si estamos en etapa empresa
         if lead_stage[call_sid] == "ask_company":
             possible_company = (speech or "").strip()
             if possible_company and len(possible_company) >= 2:
                 lead_company[call_sid] = possible_company[:120]
 
-                # Guardar en Zoho Flow
                 res = create_zoho_lead_from_call(
                     call_sid=call_sid,
+                    tw_from=tw_from,
                     caller_real=caller_real,
-                    name=lead_name[call_sid],
+                    full_name=lead_name[call_sid],
                     company=lead_company[call_sid],
                     notes=f"From={tw_from} To={tw_to} Direction={direction} Status={call_status}"
                 )
 
-                # Reset state
+                # Reset
                 lead_stage[call_sid] = ""
                 lead_name[call_sid] = ""
                 lead_company[call_sid] = ""
@@ -666,8 +742,7 @@ def ivr_llm():
                     vr.hangup()
                     return Response(str(vr), mimetype="text/xml")
 
-                # Si falló Zoho, no inventamos: agente.
-                say(vr, "Tuve un problema registrando sus datos. Le comunico con un agente.")
+                say(vr, "Tuve un problema registrando sus datos. Le comunico con soporte.")
                 return transfer_to_user(vr, DID_MAP["cola"], caller_real, tw_from)
 
             vr.pause(length=0.2)
@@ -685,7 +760,10 @@ def ivr_llm():
                 say(vr, f"Hoy es {format_fecha_la_paz()}.")
 
             vr.pause(length=0.2)
-            vr.append(gather_post_answer("/ivr-llm?mode=post", "Si desea un agente diga agente o marque cero. Si desea dejar sus datos diga datos o marque uno. O puede colgar."))
+            vr.append(gather_post_answer(
+                "/ivr-llm?mode=post",
+                "Si desea un agente, marque cero o diga agente. Si desea dejar sus datos, diga datos o marque uno. O puede colgar."
+            ))
             return Response(str(vr), mimetype="text/xml")
 
         # =========================
@@ -705,7 +783,7 @@ def ivr_llm():
             return transfer_to_user(vr, DID_MAP["cola"], caller_real, tw_from)
 
         # =========================
-        # Voice: agente/soporte
+        # Voice: soporte/agente
         # =========================
         if any(k in text for k in ["soporte", "support", "ayuda", "mesa", "tecnico", "técnico", "cola", "agente", "humano", "operador"]):
             return transfer_to_user(vr, DID_MAP["cola"], caller_real, tw_from)
@@ -713,6 +791,16 @@ def ivr_llm():
         # =========================
         # Voice directo por nombre
         # =========================
+        if speech and digits is None and name_candidate == "":
+            vr.pause(length=0.2)
+            vr.append(gather_prompt(
+                "/ivr-llm?noinput=1",
+                "Para transferirle, dígame solo el nombre: Pablo, Gonzalo, Vladimir, Paola o Ximena. "
+                "O marque cero para soporte. "
+                "Para dejar sus datos, diga datos o marque uno."
+            ))
+            return Response(str(vr), mimetype="text/xml")
+
         for name in ["pablo", "gonzalo", "vladimir", "paola", "ximena"]:
             if name in name_candidate:
                 return transfer_to_user(vr, DID_MAP[name], caller_real, tw_from)
@@ -729,34 +817,36 @@ def ivr_llm():
         # OpenAI fallback (máximo 2 turnos)
         # =========================
         if llm_turns[call_sid] >= MAX_LLM_TURNS:
-            say(vr, "Para continuar, le comunico con un agente.")
+            say(vr, "Para continuar, le comunico con soporte.")
             return transfer_to_user(vr, DID_MAP["cola"], caller_real, tw_from)
 
         llm_turns[call_sid] += 1
         respuesta = llamar_openai(call_sid, text)
         say(vr, respuesta)
 
-        # Si ya llegó al límite, ofrecer agente o datos o colgar
+        # Si ya llegó al límite, ofrecer post (agente/datos/colgar)
         if llm_turns[call_sid] >= MAX_LLM_TURNS:
             vr.pause(length=0.2)
-            vr.append(gather_post_answer("/ivr-llm?mode=post", "Si desea un agente diga agente o marque cero. Si desea dejar sus datos diga datos o marque uno. O puede colgar."))
+            vr.append(gather_post_answer(
+                "/ivr-llm?mode=post",
+                "Si desea un agente, marque cero o diga agente. Si desea dejar sus datos, diga datos o marque uno. O puede colgar."
+            ))
             return Response(str(vr), mimetype="text/xml")
 
         # Aún queda 1 pregunta más
         vr.pause(length=0.3)
-        vr.append(gather_prompt("/ivr-llm?noinput=1", "¿Qué otra consulta tiene? Si desea agente diga agente o marque cero. Si desea dejar sus datos diga datos o marque uno."))
+        vr.append(gather_prompt(
+            "/ivr-llm?noinput=1",
+            "¿Qué otra consulta tiene? Si desea soporte, diga soporte o marque cero. Si desea dejar sus datos, diga datos o marque uno."
+        ))
         return Response(str(vr), mimetype="text/xml")
 
     except Exception as e:
         logging.exception(f"ERROR en /ivr-llm: {e}")
-        say(vr, "Hubo un problema técnico. Le comunico con un agente.")
+        say(vr, "Hubo un problema técnico. Le comunico con soporte.")
         return transfer_to_user(vr, DID_MAP["cola"], "", "")
 
 @flask_app.route("/", methods=["GET"])
 def home():
     return "OK", 200
-
-
-
-
 
