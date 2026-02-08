@@ -1,3 +1,4 @@
+```python
 from flask import Flask, request, Response, jsonify
 from twilio.twiml.voice_response import VoiceResponse, Gather, Dial
 import os
@@ -26,6 +27,7 @@ MEM_TTL_SECONDS = int(os.getenv("MEM_TTL_SECONDS", "1200"))
 
 # =========================
 # ZOHO FLOW (Bigin) - DIRECTO DESDE IVR
+# (NO tocamos tu Zoho Flow: enviamos payload compatible con el Flow que ya te funciona con ElevenLabs)
 # =========================
 ZOHO_FLOW_WEBHOOK_URL = os.getenv("ZOHO_FLOW_WEBHOOK_URL", "").strip()
 ZOHO_SOURCE = os.getenv("ZOHO_SOURCE", "twilio-ivr").strip()
@@ -33,14 +35,12 @@ ZOHO_CITY_DEFAULT = os.getenv("ZOHO_CITY_DEFAULT", "Cochabamba").strip()
 
 # =========================
 # PHONE NORMALIZATION (CRM)
-# - Si viene de afuera: normalmente llega +591... o número largo -> tomamos últimos 8 dígitos (Bolivia)
-# - Si viene interno (ext corta 2-6 dígitos): intentamos mapear o usar un fallback
+# - externo: +591... o número largo -> últimos 8 dígitos (Bolivia)
+# - interno: extensión corta (ej 22 / 4000) -> map o fallback (para que NO vaya null)
 # =========================
 STRIP_COUNTRY_CODE = os.getenv("STRIP_COUNTRY_CODE", "1") == "1"
 LOCAL_NUMBER_LEN = int(os.getenv("LOCAL_NUMBER_LEN", "8"))  # Bolivia local usually 8
 
-# Si la llamada es interna y solo trae extensión corta (ej 22 / 4000),
-# puedes mapear a un celular real por extensión.
 EXT_TO_MOBILE = {
     "22":   os.getenv("EXT_22_MOBILE", "").strip(),
     "4000": os.getenv("EXT_4000_MOBILE", "").strip(),
@@ -50,8 +50,7 @@ EXT_TO_MOBILE = {
     "4007": os.getenv("EXT_4007_MOBILE", "").strip(),
 }
 
-# Fallback general para internas sin mapeo (solo para que NO vaya null).
-# Ejemplo: 70770144
+# fallback general para internas sin mapeo (solo para pruebas/evitar null)
 INTERNAL_DEFAULT_MOBILE = os.getenv("INTERNAL_DEFAULT_MOBILE", "").strip()
 
 # =========================
@@ -266,17 +265,18 @@ def choose_caller_for_transfer(caller_real: str, tw_from: str) -> str:
 # - interno: extensión corta -> map o fallback -> NUNCA null si puedes
 # =========================
 def get_phone_for_crm(caller_real: str, tw_from: str) -> str:
-    # 1) Si caller_real viene en E.164: sacamos local (últimos 8) para Bigin (si quieres)
+    # 1) caller_real E.164
     if caller_real and is_valid_e164(caller_real):
         digits = normalize_digits(caller_real)
         return to_local_digits(digits)
 
-    # 2) Si caller_real viene como dígitos
+    # 2) caller_real dígitos
     if caller_real:
         digits = normalize_digits(caller_real)
         if len(digits) >= EXTERNAL_NUM_MIN_LEN:
             return to_local_digits(digits)
-        # si es corto, lo tratamos como interno
+
+        # corto => interno
         ext = digits
         mapped = (EXT_TO_MOBILE.get(ext) or "").strip()
         if mapped:
@@ -285,7 +285,7 @@ def get_phone_for_crm(caller_real: str, tw_from: str) -> str:
             return to_local_digits(normalize_digits(INTERNAL_DEFAULT_MOBILE))
         return ext
 
-    # 3) Si no hay caller_real, miramos el From SIP
+    # 3) From SIP => extensión
     ext = extract_digits_from_sip_from(tw_from)
     if ext:
         mapped = (EXT_TO_MOBILE.get(ext) or "").strip()
@@ -298,7 +298,7 @@ def get_phone_for_crm(caller_real: str, tw_from: str) -> str:
     return ""
 
 # =========================
-# Punto 2 (Zoho): split nombre/apellido para Last_Name requerido
+# Punto: split nombre/apellido para last_name requerido
 # =========================
 def split_first_last(full_name: str):
     full_name = (full_name or "").strip()
@@ -419,6 +419,9 @@ def detect_intent_lead(text_norm: str) -> bool:
     ]
     return any(k in t for k in keys)
 
+# =========================
+# URLs / Gather
+# =========================
 def _abs_url(path: str) -> str:
     if not path.startswith("/"):
         path = "/" + path
@@ -464,6 +467,9 @@ def gather_post_answer(action_url: str, prompt_text: str):
     say(g, prompt_text)
     return g
 
+# =========================
+# Transfer
+# =========================
 def transfer_to_user(vr, target_user: str, caller_real: str, tw_from: str):
     sip_target = build_sip_uri(target_user)
     say(vr, "Perfecto, le comunico.")
@@ -478,6 +484,9 @@ def transfer_to_user(vr, target_user: str, caller_real: str, tw_from: str):
     )
     return Response(str(vr), mimetype="text/xml")
 
+# =========================
+# OpenAI
+# =========================
 def llamar_openai(call_sid: str, user_text: str) -> str:
     if not OPENAI_API_KEY:
         logging.error("[OPENAI] OPENAI_API_KEY VACIA")
@@ -512,44 +521,57 @@ def llamar_openai(call_sid: str, user_text: str) -> str:
         return "Estoy teniendo un inconveniente técnico. Si desea, lo comunico con soporte."
 
 # =========================
-# ZOHO FLOW DIRECTO
-# - Campos EXACTOS del Flow (Nombre / Apellidos requerido)
+# Zoho Flow (payload COMPATIBLE con tu Flow actual)
 # =========================
 def send_to_zoho_flow(payload: dict) -> dict:
     if not ZOHO_FLOW_WEBHOOK_URL:
+        logging.error("[ZOHO] ZOHO_FLOW_WEBHOOK_URL not configured")
         return {"ok": False, "error": "ZOHO_FLOW_WEBHOOK_URL not configured"}
 
     try:
         r = session.post(ZOHO_FLOW_WEBHOOK_URL, json=payload, timeout=20)
         ok = 200 <= r.status_code < 300
+        logging.warning(f"[ZOHO] status={r.status_code} body={(r.text or '')[:300]}")
         return {"ok": ok, "status_code": r.status_code, "response_text": (r.text or "")[:800]}
     except Exception as e:
         logging.exception(f"[ZOHO] EXCEPTION: {e}")
         return {"ok": False, "error": str(e)}
 
 def create_zoho_lead_from_call(call_sid: str, tw_from: str, caller_real: str, full_name: str, company: str, notes: str = "") -> dict:
+    """
+    IMPORTANTE:
+    - NO cambiamos tu Zoho Flow.
+    - Enviamos keys igual que el flujo que te funcionaba con ElevenLabs:
+      first_name, last_name, phone, email, wa_id, company_name, reason, notes, source, etc.
+    """
     first, last = split_first_last(full_name)
 
     phone_for_crm = get_phone_for_crm(caller_real, tw_from)
+    phone_for_crm = str(phone_for_crm) if phone_for_crm else None
 
-    zoho_payload = {
-        "Nombre": first or None,
-        "Apellidos": (last or "N/A"),  # requerido
-        "Company": (company or "").strip() or "",
-        "Móvil": phone_for_crm or None,
-        "Teléfono": "",
+    payload = {
+        # keys que tu Zoho Flow está usando en el action
+        "first_name": first or None,
+        "last_name": (last or "N/A"),  # requerido
+        "phone": phone_for_crm,
+        "email": None,
+        "wa_id": None,
 
-        "Correo electrónico": None,
-
-        "Fuente de referencia": "WPPLLM",
-        "Update existing contact?": True,
-        "Descripción": (notes or "").strip(),
-        "Record Creation Source ID": call_sid,
-
-        "Fuente de Posible cliente": ZOHO_SOURCE,
+        # estilo ElevenLabs / tracking
+        "source": ZOHO_SOURCE,
+        "ts": int(time.time()),
+        "created_at": int(time.time()),
+        "call_sid": call_sid,
+        "company_name": (company or "").strip() or None,
+        "reason": "twilio-ivr",
+        "notes": (notes or "").strip(),
+        "human_requested": None,
+        "callback_requested": True,
+        "last_intent": "ivr_lead_capture",
+        "city": ZOHO_CITY_DEFAULT,
     }
 
-    return send_to_zoho_flow(zoho_payload)
+    return send_to_zoho_flow(payload)
 
 # =========================
 # DEBUG ENDPOINTS
@@ -658,7 +680,6 @@ def ivr_llm():
             if noinput <= MAX_NOINPUT_ATTEMPTS:
                 vr.pause(length=RETRY_PAUSE_SEC if noinput > 1 else INITIAL_PAUSE_SEC)
 
-                # Mensaje original + SOLO añadimos "datos/1"
                 if noinput == 1:
                     prompt = (
                         f"{saludo_por_hora()} Gracias por llamar a Nuxway Technology. "
@@ -732,7 +753,7 @@ def ivr_llm():
                     notes=f"From={tw_from} To={tw_to} Direction={direction} Status={call_status}"
                 )
 
-                # Reset
+                # Reset lead state
                 lead_stage[call_sid] = ""
                 lead_name[call_sid] = ""
                 lead_company[call_sid] = ""
@@ -849,4 +870,5 @@ def ivr_llm():
 @flask_app.route("/", methods=["GET"])
 def home():
     return "OK", 200
+```
 
