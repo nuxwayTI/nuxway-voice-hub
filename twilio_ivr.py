@@ -1,4 +1,3 @@
-
 from flask import Flask, request, Response, jsonify
 from twilio.twiml.voice_response import VoiceResponse, Gather, Dial
 import os
@@ -449,6 +448,24 @@ def gather_prompt(action_url: str, prompt_text: str, num_digits: int = 4):
     say(g, prompt_text)
     return g
 
+# ✅ NUEVO: Gather SOLO VOZ (para nombre/empresa) -> evita que DTMF dispare el action y rompa el flujo de "datos"
+def gather_speech_prompt(action_url: str, prompt_text: str):
+    g = Gather(
+        input="speech",
+        language="es-MX",
+        timeout=GATHER_TIMEOUT,
+        speech_timeout=SPEECH_TIMEOUT,
+        action=_abs_url(action_url),
+        method="POST",
+        barge_in=True,
+        action_on_empty_result=True,
+        speech_model="phone_call",
+        enhanced=True,
+        hints=",".join(SPEECH_HINTS),
+    )
+    say(g, prompt_text)
+    return g
+
 def gather_post_answer(action_url: str, prompt_text: str):
     g = Gather(
         input="dtmf speech",
@@ -666,7 +683,8 @@ def ivr_llm():
                 lead_stage[call_sid] = "ask_name"
                 say(vr, "Perfecto. Voy a registrar sus datos.")
                 vr.pause(length=0.2)
-                vr.append(gather_prompt("/ivr-llm?noinput=1", "¿Cuál es su nombre y apellido?", num_digits=1))
+                # ✅ SOLO VOZ para nombre (evita que DTMF rompa el flujo)
+                vr.append(gather_speech_prompt("/ivr-llm?noinput=1", "¿Cuál es su nombre y apellido?"))
                 return Response(str(vr), mimetype="text/xml")
 
             say(vr, "De acuerdo. Gracias por llamar a Nuxway. Hasta luego.")
@@ -723,7 +741,8 @@ def ivr_llm():
             lead_stage[call_sid] = "ask_name"
             say(vr, "Perfecto. Voy a registrar sus datos en el CRM.")
             vr.pause(length=0.2)
-            vr.append(gather_prompt("/ivr-llm?noinput=1", "¿Cuál es su nombre y apellido?", num_digits=1))
+            # ✅ SOLO VOZ para nombre
+            vr.append(gather_speech_prompt("/ivr-llm?noinput=1", "¿Cuál es su nombre y apellido?"))
             return Response(str(vr), mimetype="text/xml")
 
         if lead_stage[call_sid] == "ask_name":
@@ -732,11 +751,13 @@ def ivr_llm():
                 lead_name[call_sid] = possible_name[:80]
                 lead_stage[call_sid] = "ask_company"
                 vr.pause(length=0.2)
-                vr.append(gather_prompt("/ivr-llm?noinput=1", "Gracias. ¿Cuál es el nombre de su empresa?", num_digits=1))
+                # ✅ SOLO VOZ para empresa
+                vr.append(gather_speech_prompt("/ivr-llm?noinput=1", "Gracias. ¿Cuál es el nombre de su empresa?"))
                 return Response(str(vr), mimetype="text/xml")
 
             vr.pause(length=0.2)
-            vr.append(gather_prompt("/ivr-llm?noinput=1", "¿Me repite su nombre y apellido, por favor?", num_digits=1))
+            # ✅ SOLO VOZ reintento nombre
+            vr.append(gather_speech_prompt("/ivr-llm?noinput=1", "¿Me repite su nombre y apellido, por favor?"))
             return Response(str(vr), mimetype="text/xml")
 
         if lead_stage[call_sid] == "ask_company":
@@ -767,7 +788,8 @@ def ivr_llm():
                 return transfer_to_user(vr, DID_MAP["cola"], caller_real, tw_from)
 
             vr.pause(length=0.2)
-            vr.append(gather_prompt("/ivr-llm?noinput=1", "¿Cuál es el nombre de su empresa?", num_digits=1))
+            # ✅ SOLO VOZ reintento empresa
+            vr.append(gather_speech_prompt("/ivr-llm?noinput=1", "¿Cuál es el nombre de su empresa?"))
             return Response(str(vr), mimetype="text/xml")
 
         # =========================
@@ -870,5 +892,6 @@ def ivr_llm():
 @flask_app.route("/", methods=["GET"])
 def home():
     return "OK", 200
+
 
 
