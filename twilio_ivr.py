@@ -448,7 +448,7 @@ def gather_prompt(action_url: str, prompt_text: str, num_digits: int = 4):
     say(g, prompt_text)
     return g
 
-# ✅ NUEVO: Gather SOLO VOZ (para nombre/empresa) -> evita que DTMF dispare el action y rompa el flujo de "datos"
+# ✅ Gather SOLO VOZ (para nombre/empresa)
 def gather_speech_prompt(action_url: str, prompt_text: str):
     g = Gather(
         input="speech",
@@ -480,6 +480,20 @@ def gather_post_answer(action_url: str, prompt_text: str):
         speech_model="phone_call",
         enhanced=True,
         hints="agente,humano,operador,soporte,cero,0,datos,uno,1",
+    )
+    say(g, prompt_text)
+    return g
+
+# ✅ NUEVO: pedir extensión (4 dígitos) cuando el usuario marca "más de un dígito"
+def gather_ext(action_url: str, prompt_text: str):
+    g = Gather(
+        input="dtmf",
+        num_digits=4,
+        timeout=8,
+        action=_abs_url(action_url),
+        method="POST",
+        barge_in=True,
+        action_on_empty_result=True,
     )
     say(g, prompt_text)
     return g
@@ -567,14 +581,11 @@ def create_zoho_lead_from_call(call_sid: str, tw_from: str, caller_real: str, fu
     phone_for_crm = str(phone_for_crm) if phone_for_crm else None
 
     payload = {
-        # keys que tu Zoho Flow está usando en el action
         "first_name": first or None,
-        "last_name": (last or "N/A"),  # requerido
+        "last_name": (last or "N/A"),
         "phone": phone_for_crm,
         "email": None,
         "wa_id": None,
-
-        # estilo ElevenLabs / tracking
         "source": ZOHO_SOURCE,
         "ts": int(time.time()),
         "created_at": int(time.time()),
@@ -671,6 +682,32 @@ def ivr_llm():
         logging.warning(f"[DTMF] digits recibido: {digits}")
 
         # =========================
+        # MODO EXT: el usuario marcó algo distinto a 0/1 y ahora pedimos 4 dígitos
+        # =========================
+        if mode == "ext":
+            if digits == "4000":
+                return transfer_to_user(vr, DID_MAP["pablo"], caller_real, tw_from)
+            if digits == "4001":
+                return transfer_to_user(vr, DID_MAP["gonzalo"], caller_real, tw_from)
+            if digits == "4002":
+                return transfer_to_user(vr, DID_MAP["vladimir"], caller_real, tw_from)
+            if digits == "4003":
+                return transfer_to_user(vr, DID_MAP["paola"], caller_real, tw_from)
+            if digits == "4007":
+                return transfer_to_user(vr, DID_MAP["ximena"], caller_real, tw_from)
+            if digits == "0000":
+                return transfer_to_user(vr, DID_MAP["cola"], caller_real, tw_from)
+
+            # Si no reconoció extensión, vuelve al menú rápido
+            vr.pause(length=0.2)
+            vr.append(gather_prompt(
+                "/ivr-llm?noinput=1",
+                "No reconocí esa extensión. Marque cero para soporte, uno para dejar sus datos, o diga el nombre de la persona.",
+                num_digits=1
+            ))
+            return Response(str(vr), mimetype="text/xml")
+
+        # =========================
         # POST-ANSWER MODE: decidir agente / datos / colgar
         # =========================
         if mode == "post":
@@ -683,7 +720,6 @@ def ivr_llm():
                 lead_stage[call_sid] = "ask_name"
                 say(vr, "Perfecto. Voy a registrar sus datos.")
                 vr.pause(length=0.2)
-                # ✅ SOLO VOZ para nombre (evita que DTMF rompa el flujo)
                 vr.append(gather_speech_prompt("/ivr-llm?noinput=1", "¿Cuál es su nombre y apellido?"))
                 return Response(str(vr), mimetype="text/xml")
 
@@ -692,7 +728,7 @@ def ivr_llm():
             return Response(str(vr), mimetype="text/xml")
 
         # =========================
-        # SILENCIO / NOINPUT
+        # SILENCIO / NOINPUT (MENÚ PRINCIPAL)
         # =========================
         if not speech and not digits:
             if noinput <= MAX_NOINPUT_ATTEMPTS:
@@ -713,7 +749,8 @@ def ivr_llm():
                         "Para dejar sus datos, diga datos o marque uno."
                     )
 
-                vr.append(gather_prompt(f"/ivr-llm?noinput={noinput+1}", prompt))
+                # ✅ CLAVE: 1 dígito para que 0/1 sean inmediatos
+                vr.append(gather_prompt(f"/ivr-llm?noinput={noinput+1}", prompt, num_digits=1))
                 return Response(str(vr), mimetype="text/xml")
 
             say(vr, "Parece que la llamada está con poco audio. Le comunico con soporte.")
@@ -729,19 +766,37 @@ def ivr_llm():
         # Repregunta si STT viene flojo
         if speech and digits is None and confidence is not None and confidence < MIN_CONFIDENCE_REPROMPT:
             vr.pause(length=0.3)
-            vr.append(gather_prompt("/ivr-llm?noinput=1", "Disculpe, no le entendí bien. Repita por favor."))
+            vr.append(gather_prompt("/ivr-llm?noinput=1", "Disculpe, no le entendí bien. Repita por favor.", num_digits=1))
             return Response(str(vr), mimetype="text/xml")
 
         logging.info(f"[CALL {call_sid}] speech='{text}' candidate='{name_candidate}' digits='{digits}' llm_turns={llm_turns[call_sid]} lead_stage={lead_stage[call_sid]}")
 
         # =========================
-        # LEAD CAPTURE (ETAPAS)
+        # DTMF: 0/1 inmediato, y cualquier otro -> pedir extensión 4 dígitos
         # =========================
-        if digits == "1" or detect_intent_lead(text):
+        if digits == "0":
+            return transfer_to_user(vr, DID_MAP["cola"], caller_real, tw_from)
+
+        if digits == "1":
             lead_stage[call_sid] = "ask_name"
             say(vr, "Perfecto. Voy a registrar sus datos en el CRM.")
             vr.pause(length=0.2)
-            # ✅ SOLO VOZ para nombre
+            vr.append(gather_speech_prompt("/ivr-llm?noinput=1", "¿Cuál es su nombre y apellido?"))
+            return Response(str(vr), mimetype="text/xml")
+
+        # Si marcó algo distinto a 0/1 (ej: "4"), pedimos extensión completa
+        if digits and digits not in ["0", "1"]:
+            vr.pause(length=0.2)
+            vr.append(gather_ext("/ivr-llm?mode=ext", "Marque la extensión de cuatro dígitos, por favor."))
+            return Response(str(vr), mimetype="text/xml")
+
+        # =========================
+        # LEAD CAPTURE por voz (si dice "datos")
+        # =========================
+        if detect_intent_lead(text):
+            lead_stage[call_sid] = "ask_name"
+            say(vr, "Perfecto. Voy a registrar sus datos en el CRM.")
+            vr.pause(length=0.2)
             vr.append(gather_speech_prompt("/ivr-llm?noinput=1", "¿Cuál es su nombre y apellido?"))
             return Response(str(vr), mimetype="text/xml")
 
@@ -751,12 +806,10 @@ def ivr_llm():
                 lead_name[call_sid] = possible_name[:80]
                 lead_stage[call_sid] = "ask_company"
                 vr.pause(length=0.2)
-                # ✅ SOLO VOZ para empresa
                 vr.append(gather_speech_prompt("/ivr-llm?noinput=1", "Gracias. ¿Cuál es el nombre de su empresa?"))
                 return Response(str(vr), mimetype="text/xml")
 
             vr.pause(length=0.2)
-            # ✅ SOLO VOZ reintento nombre
             vr.append(gather_speech_prompt("/ivr-llm?noinput=1", "¿Me repite su nombre y apellido, por favor?"))
             return Response(str(vr), mimetype="text/xml")
 
@@ -788,7 +841,6 @@ def ivr_llm():
                 return transfer_to_user(vr, DID_MAP["cola"], caller_real, tw_from)
 
             vr.pause(length=0.2)
-            # ✅ SOLO VOZ reintento empresa
             vr.append(gather_speech_prompt("/ivr-llm?noinput=1", "¿Cuál es el nombre de su empresa?"))
             return Response(str(vr), mimetype="text/xml")
 
@@ -810,22 +862,6 @@ def ivr_llm():
             return Response(str(vr), mimetype="text/xml")
 
         # =========================
-        # DTMF routing
-        # =========================
-        if digits == "4000":
-            return transfer_to_user(vr, DID_MAP["pablo"], caller_real, tw_from)
-        if digits == "4001":
-            return transfer_to_user(vr, DID_MAP["gonzalo"], caller_real, tw_from)
-        if digits == "4002":
-            return transfer_to_user(vr, DID_MAP["vladimir"], caller_real, tw_from)
-        if digits == "4003":
-            return transfer_to_user(vr, DID_MAP["paola"], caller_real, tw_from)
-        if digits == "4007":
-            return transfer_to_user(vr, DID_MAP["ximena"], caller_real, tw_from)
-        if digits == "0":
-            return transfer_to_user(vr, DID_MAP["cola"], caller_real, tw_from)
-
-        # =========================
         # Voice: soporte/agente
         # =========================
         if any(k in text for k in ["soporte", "support", "ayuda", "mesa", "tecnico", "técnico", "cola", "agente", "humano", "operador"]):
@@ -840,7 +876,8 @@ def ivr_llm():
                 "/ivr-llm?noinput=1",
                 "Para transferirle, dígame solo el nombre: Pablo, Gonzalo, Vladimir, Paola o Ximena. "
                 "O marque cero para soporte. "
-                "Para dejar sus datos, diga datos o marque uno."
+                "Para dejar sus datos, diga datos o marque uno.",
+                num_digits=1
             ))
             return Response(str(vr), mimetype="text/xml")
 
@@ -880,7 +917,8 @@ def ivr_llm():
         vr.pause(length=0.3)
         vr.append(gather_prompt(
             "/ivr-llm?noinput=1",
-            "¿Qué otra consulta tiene? Si desea soporte, diga soporte o marque cero. Si desea dejar sus datos, diga datos o marque uno."
+            "¿Qué otra consulta tiene? Si desea soporte, diga soporte o marque cero. Si desea dejar sus datos, diga datos o marque uno.",
+            num_digits=1
         ))
         return Response(str(vr), mimetype="text/xml")
 
@@ -892,6 +930,7 @@ def ivr_llm():
 @flask_app.route("/", methods=["GET"])
 def home():
     return "OK", 200
+
 
 
 
